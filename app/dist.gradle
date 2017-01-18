@@ -1,0 +1,931 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath group: 'org.apache.commons', name: 'commons-email', version: '1.3.3'
+        classpath 'com.sun.mail:all:1.5.2'
+        classpath 'javax.activation:activation:1.1.1'
+    }
+}
+
+apply plugin: 'com.android.application'
+
+
+
+import org.apache.commons.mail.EmailAttachment
+import org.apache.commons.mail.MultiPartEmail
+import org.apache.tools.ant.taskdefs.condition.Os
+
+import javax.mail.Session
+import java.text.SimpleDateFormat
+// ====================================
+// Helper classes and utilities
+// ====================================
+
+/** Constants container */
+public final class C {
+    public static def GROUP_DIST_SEND = "Distribution Send"
+    public static def GROUP_DISTRIBUTION = "Distribution"
+    public static def GROUP_DISTRIBUTION_UTILITY = "Distribution Utility"
+    public static def CRASHLYTICS_UPLOAD_BASE_NAME = "crashlyticsUploadDistribution"
+    public static def DIST_CONFIG_TASK = "distConfigTask"
+
+}
+
+/**
+ * A distribution configuration class. Default values are initialized with a configuration properties file
+ * then overwritten with the values specified in local.properties in the root of the project.
+ * Stores the version information as well as the distribution channel config.
+ */
+public class DistConfig {
+    // config keys
+    public static final CONFIG_FILE_NAME = "dist-config.properties"
+    public static final KEY_VERSION_MAJOR = "version.major"
+    public static final KEY_VERSION_MINOR = "version.minor"
+    public static final KEY_VERSION_FIX = "version.fix"
+    public static final KEY_BUILD_NUMBER = "version.build.number"
+    public static final KEY_DIST_DIRECTORY = "dist.directory"
+    public static final KEY_RELEASE_NOTE_REGEX = "release.note.filter"
+    public static final KEY_ANDROID_VERSION_CODE = "android.version.code"
+    public static final KEY_BASE_APK_NAME ="base.apk.name"
+    public static final KEY_MAIL_SUBJECT_PREFIX = "mail.subject.prefix"
+    public static final DEFAULT_VERSION_TEMPLATE = 'v${name}-${variant}-${version}'
+    public static final MAIL_FROM = "mail.from"
+    public static final MAIL_TO = "mail.to"
+    public static final MAIL_FROM_PASSWORD = "mail.from.password"
+    public static final SMTP_SERVER  = "mail.smtp.server"
+    public static final SMTP_SERVER_PORT  = "mail.smtp.server.port"
+    public static final SEND_MAIL = "mail.send"
+
+    // parameters
+    public static final MAJOR = "major"
+    public static final MINOR = "minor"
+    public static final BUILD = "build"
+
+    private final Properties config
+    private final Properties localConfig
+
+    private File configFile
+    private VersionInfo original
+    private VersionInfo current
+    public final String releaseNoteRegex
+    public final File dir
+    private final Project project
+
+    public DistConfig(Project project, File configDir, String configFilename = CONFIG_FILE_NAME, String versionTemplate = DEFAULT_VERSION_TEMPLATE) {
+        this.project = project
+        // load the configuration
+        configFile = new File(configDir, configFilename)
+        config = new Properties()
+        config.load(new FileReader(configFile))
+        // try to find local config aside from versioning, properties in it should take precedence over the standard config
+        localConfig = new Properties()
+        File localConfigFile = new File(project.getRootDir(), "local.properties")
+        if (localConfigFile.exists()) {
+            localConfig.load(new FileReader(localConfigFile))
+        } else {
+            info("local config not found: " + localConfigFile.absolutePath)
+        }
+        releaseNoteRegex = getConfigProperty(KEY_RELEASE_NOTE_REGEX, "")
+
+        dir = project.file(new File(getConfigProperty(KEY_DIST_DIRECTORY)))
+        if (!dir.exists()) {
+            dir.mkdirs()
+        }
+
+        // load version
+        original = new VersionInfo((config.getProperty(KEY_VERSION_MAJOR) as Integer).intValue(),
+                            (config.getProperty(KEY_VERSION_MINOR) as Integer).intValue(),
+                            (config.getProperty(KEY_VERSION_FIX) as Integer).intValue(),
+                            (config.getProperty(KEY_BUILD_NUMBER) as Integer).intValue(),
+                            (config.getProperty(KEY_ANDROID_VERSION_CODE) as Integer).intValue())
+
+        current = new VersionInfo(original.major, original.minor, original.fix,
+                                    original.buildNumber, original.androidVersionCode)
+    }
+
+    public static int fetchVersionNumberProperty(Project p, String name, int currentValue) {
+        if(!p.hasProperty(name)) return currentValue;
+        else if (p.property(name) != null) return p.property(name) as int
+        else return currentValue+1
+    }
+
+    def adjustVersion() {
+        current.major = fetchVersionNumberProperty(project, MAJOR, current.major)
+        current.minor = fetchVersionNumberProperty(project, MINOR, current.minor)
+        if (current.equals(original)) {
+            // build export
+            Log.info("Adjusting Version: Incrementing build from ${current.buildNumber} to ${current.buildNumber+1}")
+            current.buildNumber = current.buildNumber + 1
+        } else {
+            // new version export
+            current.androidVersionCode = current.androidVersionCode + 1
+            current.buildNumber = 1     // restart build numbering for new version
+            Log.info("Adjusting Version: Changing from " +
+                    "${original.versionString(true, false)} to ${current.versionString(true, false)}")
+        }
+    }
+
+    def major() { current.major }
+
+    def minor() { current.minor }
+
+    def buildNumber() { current.buildNumber }
+
+    def androidVersionCode() { current.androidVersionCode }
+
+    def versionOrBuildChanged() { return versionChanged() || original.buildNumber != current.buildNumber }
+    def versionChanged() { return original.major != current.major || original.minor != current.minor }
+    def persistVersion() { persistVersion0(current)}
+
+    private def persistVersion0(VersionInfo version) {
+        config.setProperty(KEY_VERSION_MAJOR, version.major as String)
+        config.setProperty(KEY_VERSION_MINOR, version.minor as String)
+        config.setProperty(KEY_BUILD_NUMBER, version.buildNumber as String)
+        config.setProperty(KEY_ANDROID_VERSION_CODE, version.androidVersionCode as String)
+        config.store(new FileWriter(configFile), null)
+    }
+
+    def revertVersion() {
+        persistVersion0(original)
+    }
+
+    def baseApkName() { getConfigProperty(KEY_BASE_APK_NAME) }
+
+    // ================================
+    // mail config
+
+    def mailFrom() { getConfigProperty(MAIL_FROM)}
+
+    def mailFromPassword() { getConfigProperty(MAIL_FROM_PASSWORD) }
+
+    String smtpServer() { getConfigProperty(SMTP_SERVER)}
+
+    int smtpServerPort() { Integer.parseInt(getConfigProperty(SMTP_SERVER_PORT)) }
+
+    def mailTo() { getConfigProperty(MAIL_TO)}
+
+    def mailSubjectPrefix(String defaultValue = "") {
+        getConfigProperty(KEY_MAIL_SUBJECT_PREFIX, defaultValue)
+    }
+
+    private def getConfigProperty(String name, String defaultValue = null) {
+        if (localConfig.get(name)) return localConfig.get(name)
+        else return config.get(name, defaultValue)
+    }
+
+    def releaseNotesFilename() { "RELEASE-NOTES-${project.name}-${current.versionString(true, true)}.txt" }
+
+    File releaseNotesFile() { new File(dir, releaseNotesFilename()) }
+}
+
+final class VersionInfo {
+    private static final SimpleDateFormat DEFAULT_DATE_FORMAT = new SimpleDateFormat("MM.dd.yyyy")
+    public int major, minor, fix, buildNumber, androidVersionCode
+
+    public String qualifier
+    public VersionInfo(int major, int minor, int fix, int buildNumber, int androidVersionCode, String qualifier = DEFAULT_DATE_FORMAT.format(new Date())) {
+        this.major = major
+        this.minor = minor
+        this.fix = fix
+        this.buildNumber = buildNumber
+        this.androidVersionCode = androidVersionCode
+        this.qualifier = qualifier
+    }
+
+    def apkVersionString() {
+        return "$major.$minor.$fix-$buildNumber"
+    }
+
+    def versionString(boolean withBuild = true, boolean qualified = true) {
+        def res = "v$major.$minor.$fix"
+        if (withBuild) res = res + "-$buildNumber"
+        if (qualified) res = res + "-$qualifier"
+        return res
+    }
+
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == null || !(o instanceof VersionInfo)) {
+            return false
+        } else {
+            VersionInfo obj = (VersionInfo) o
+            return this.major == obj.major &&
+                    this.minor == obj.minor &&
+                    this.buildNumber == obj.buildNumber
+            this.androidVersionCode == obj.androidVersionCode
+        }
+    }
+}
+
+final class Distribution {
+    private final List<File> apks = new ArrayList<File>()
+
+    def addAPK(File apk) { apks.add(apk) }
+
+    def apks() {
+        invariantCheck()
+        return apks
+    }
+
+    def releaseNotes() {
+        invariantCheck()
+        return releaseNotes
+    }
+
+    def hasAPKs() { return !apks.empty }
+
+    def invariantCheck() {
+        if (!hasAPKs()) throw new GradleException("Invalid Distribution. No apks set")
+    }
+}
+
+class Log {
+    public static def abort(String msg) {
+        println("[ERROR] ${msg}. Aborting")
+        throw new GradleException(msg)
+    }
+    public static def info(String msg) { println("[INFO] ${msg}") }
+}
+
+class Utils {
+    public static boolean isWorkingDirClean() {
+        def cmd = "git diff --exit-code --quiet"
+        if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+            cmd = "cmd /c " + cmd
+        }
+        def proc = cmd.execute()
+        proc.waitFor()
+        return proc.exitValue() == 0
+    }
+
+    /** Escapes the given command and arguments so it can be executed on a windows
+     *
+     *  NOTE: by no means this method is complete in regards to all special
+     *  characters and cases related to the windows command execution. It is implemented
+     *  solely for the purposes of this script and covers only the necessary cases
+     *
+     * @param cmd the command and arguments list
+     * @return a list with the escaped command and arguments
+     */
+    public static List<String> fixCmdForWindows(List<String> cmd) {
+        if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+            // the ^ is an escape character for the windows prompt, so it needs to be escaped in any case
+            List<String> fixed = cmd.collect { part ->
+                    return part.replace("^", "^^")
+            }
+            fixed.add(0, "/c")
+            fixed.add(0, "cmd")
+            return fixed
+        }
+        return cmd
+    }
+
+    public static Distribution fetchDistribution(DistConfig config) {
+        List<File> apks = config.dir.list(new FilenameFilter() {
+            @Override
+            boolean accept(File file, String s) {
+                return s.contains(config.current.versionString()) && s.toLowerCase().endsWith(".apk")
+            }
+        }).collect { new File(config.dir, it) }
+        List<File> releaseNotes = config.dir.list(new FilenameFilter() {
+            @Override
+            boolean accept(File file, String s) {
+                def sl = s.toLowerCase()
+                return sl.contains("release") && sl.contains("notes") && sl.contains(config.current.versionString())
+            }
+        }).collect { new File(config.dir, it) }
+
+        Distribution result = new Distribution()
+
+        apks.each { result.addAPK(it) }
+
+        return result;
+    }
+    public static boolean fabricAvailable(Project p) { return p.plugins.hasPlugin("io.fabric") }
+
+
+    public static List<String> extractReleaseNotes(String regexLineFilter, List<String> lines) {
+        List<String> releaseNotes = lines.collect { line ->   // strip quotes
+            if (line.startsWith("\"")) {
+                line = line.substring(1)
+            }
+            if (line.endsWith("\"")) {
+                line = line.substring(0, line.length()-1)
+            }
+            line.trim()
+        }.findAll { line ->
+            (regexLineFilter.isEmpty())? !line.isEmpty() : line.matches(regexLineFilter)
+
+        }
+        return releaseNotes
+    }
+
+    public static void writeReleaseNotes(List<String> notes, File to) {
+        writeReleaseNotes(notes.join('\n'), to)
+    }
+
+    public static void writeReleaseNotes(String notes, File to) {
+        to.withPrintWriter { it.println(notes) }
+        Log.info("Release notes written to: ${to.absolutePath}")
+    }
+}
+
+class GitUtils {
+
+    // TODO rework the -am flag and just add the modified properties file.
+    // this prevents users from keeping files out of the repository
+    public static def gitCommitAll(String msg) {
+        File f = null
+        try {
+            Process proc = execAndWait(["git", "add", "."])
+            if (proc.exitValue() != 0) {
+                throw new RuntimeException("Bad Exit value from 'git add' ${proc.exitValue()}")
+            }
+            f = File.createTempFile("commit", "msg")
+            PrintWriter pw = new PrintWriter(f)
+            msg.split("\n").each { pw.println(it) }
+            pw.flush()
+            pw.close()
+
+            proc = execAndWait(["git", "commit","-F", "\"${f.getAbsolutePath()}\""])
+            if (proc.exitValue() != 0) {
+                throw new RuntimeException("Bad exit value on commit: ${proc.exitValue()}")
+            }
+        } catch (Exception ex) {
+            execAndWait(["git", "reset", "HEAD"])
+            execAndWait(["git", "checkout", "--", "."])
+            ex.printStackTrace();
+
+            Log.abort(ex.getMessage())
+        } finally {
+            if (f != null) {
+                f.delete()
+            }
+        }
+    }
+
+    public static def makeGitTag(String name, String message) {
+        return execAndWait(["git", "tag", name, "-m$message"])
+    }
+
+    public static void tagCommit(String tagName, String commit, String message) {
+        def cmd = ["git", "tag", "-a", tagName, commit, "-m$message"]
+        execAndWait(cmd)
+    }
+
+    public static def fetchCommitByTagFilter(String filter, boolean latest = true) {
+        def cmd = ["git", "for-each-ref", "--sort=taggerdate",
+                   "--format='%(objectname)'", "refs/tags/$filter"]
+        List<String> output = Collections.emptyList()
+        execAndWait(cmd) { output = it.text.readLines() }
+        if (!output.empty) {
+            return (latest)? output.last().trim() : output.first().trim()
+        } else {
+            return ""
+        }
+    }
+
+    /**
+     * Fetches the tags matched by the given filter.
+     *
+     * @param filter the filter to use for the tags pass * if you don't want filtering
+     * @return the list of tags matching the given filter sorted by ascending date,
+     *  the last in the list is the latest
+     */
+    public static List<String> fetchTagsByDate(String filter = "*") {
+        def cmd = ["git", "for-each-ref", "--sort=taggerdate",
+                   "--format='%(refname)'", "refs/tags/$filter"]
+        List<String> output = Collections.emptyList()
+        execAndWait(cmd) { output = it.text.readLines() }
+        // for reasons unknown to me, the output lines are returned in single quotes
+        // strip the ref path and single quotes if any
+        for (int i = 0; i < output.size(); i++) {
+            String tag = output.get(i)
+            tag = tag.substring(tag.lastIndexOf('/')+1)
+            if (tag.endsWith("'")) {
+                tag = tag.substring(0, tag.length()-1).trim()
+            }
+            output.set(i, tag)
+        }
+        return output;
+    }
+
+    public static String fetchTag(String filter, boolean latest = true) {
+        List<String> tags = fetchTagsByDate(filter)
+        if (!tags.empty) {
+            return (latest)? tags.last() : tags.first()
+        } else {
+            return ""
+        }
+    }
+
+    public static String fetchTagCommit(String tagNameOrHash) {
+        def text = ""
+        execAndWait(["git", "rev-parse", "$tagNameOrHash^{commit}"]){
+            if (!it.text.readLines().empty)
+                text = it.text.readLines().first()
+        }
+        return text
+    }
+
+    public static String fetchHeadHash() {
+        def text = ""
+        execAndWait(["git", "rev-parse", "HEAD"]){
+            if (!it.text.readLines().empty)
+                text = it.text.readLines().first()
+        }
+        return text
+    }
+
+    public static def fetchCommitsByHeaderMessage(String filter) {
+        List<String> list = Collections.emptyList();
+        execAndWait(["git", "log", "--grep=$filter", "--format=%H"]){ list = it.text.readLines(); }
+        return list
+    }
+
+    public static List<String> fetchCommitMessage(String commit) {
+        File output = null;
+        try {
+            def cmd = Utils.fixCmdForWindows(["git", "log", "--format=%B", "-n", "1", commit])
+
+            List<String> lines = Collections.emptyList()
+            output = File.createTempFile("commit-message", "tmp")
+            ProcessBuilder pb = new ProcessBuilder(cmd)
+            pb.redirectOutput(ProcessBuilder.Redirect.to(output))
+            def collectOutput = { proc ->
+                lines = output.readLines()
+                return proc
+            }
+            checkExitValue(cmd, collectOutput(wait(pb.start())))
+
+            return lines
+        } finally {
+            if (output != null) {
+                output.delete()
+            }
+        }
+    }
+
+    public static List<String> fetchCommitMsgs(startCommitHash) {
+        List<String> lines = Collections.emptyList()
+        String commitRange = "HEAD"
+        if (startCommitHash != null && !startCommitHash.trim().isEmpty()) {
+            commitRange = "$startCommitHash..HEAD"
+        }
+        File output = null
+        try {
+            output = File.createTempFile("dist-out-${System.currentTimeMillis()}", "tmp")
+
+            def cmd = Utils.fixCmdForWindows(["git", "log", "--format=%B", commitRange])
+            ProcessBuilder pb = new ProcessBuilder(cmd)
+            pb.redirectOutput(ProcessBuilder.Redirect.to(output))
+            def collectOutput = { proc ->
+                lines = output.readLines()
+                return proc
+            }
+            checkExitValue(cmd, collectOutput(wait( pb.start() )) )
+
+            return lines
+        } finally {
+            if (output != null) {
+                output.delete()
+            }
+        }
+    }
+
+    public static String fetchHeadBuildTagName() {
+        def text = ""
+        execAndWait(["git", "tag", "-l", "--contains", "HEAD"]){
+            if (!it.text.readLines().empty)
+                text = it.text.readLines().first().trim()
+        }
+        return text
+    }
+
+    public static boolean isHEADBuildExportPoint() {
+        def prevDistPointHash = GitUtils.fetchTag("v*")
+        def headHash = GitUtils.fetchHeadHash()
+        def prevBuildCommit = GitUtils.fetchTagCommit(prevDistPointHash)
+        return headHash.equals(prevBuildCommit)
+    }
+
+    private static def execAndWait(List<String> cmd, Closure onFinish = null) {
+        def cmd0 = cmd
+        if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+            cmd0 = Utils.fixCmdForWindows(cmd)
+        }
+        def proc = cmd0.execute()
+        proc.waitFor()
+        if (onFinish != null) {
+            onFinish(proc)
+        }
+        checkExitValue(cmd0, proc)
+        return proc
+    }
+
+    static def wait(Process process) {
+        process.waitFor()
+        return process;
+    }
+
+    private static def checkExitValue(List<String> cmd, Process proc) {
+        int res = proc.exitValue()
+        String cmdPrint = cmd.join(" ")
+        if (cmdPrint.length() > 512) {
+            cmdPrint = cmdPrint.substring(0, 512)+ " ..."
+        }
+        if (res != 0) {
+            Log.info("Unexpected exit from command [$cmdPrint]. ExitCode: ${res}")
+        } else {
+            Log.info("Executed: $cmdPrint")
+        }
+        return proc
+    }
+}
+
+// publish methods for script usage
+def abort = Log.&abort
+def info = Log.&info
+def isWorkingDirClean = Utils.&isWorkingDirClean
+def fetchDistribution = Utils.&fetchDistribution
+def fabricAvailable = Utils.&fabricAvailable
+
+
+// ====================================
+// Task classes definition
+// ====================================
+
+/**
+ * A predefined task combining the build and distribution of all build types.
+ * This is the primary goal of the distribution process.
+ * As such triggering this task in addition to distributing reflects it
+ * in the git repository by creating a commit and tagging it with the version being distributed
+ * and builds the RELEASE_NOTES_vXXX.txt file by doing filtering
+ * on the commit messages since the previous version distribution.
+ */
+class Dist extends DefaultTask {
+
+    public Dist() {
+        outputs.upToDateWhen{ false }
+        this.dependsOn(C.DIST_CONFIG_TASK)
+        this.dependsOn("checkWorkingDir")
+        group = C.GROUP_DISTRIBUTION
+    }
+
+    @TaskAction
+    void distAll() {
+        if (GitUtils.isHEADBuildExportPoint()) {
+            Log.abort("Already distributed. Current commit is a build export point.")
+        }
+
+        DistConfig config = project.ext.distConfig
+        def newTagName = config.current.versionString(true, true)
+
+        def prevDistPointHash = GitUtils.fetchTag("v*")
+
+        Log.info("gathering build notes")
+        List<String> buildNotes = Utils.extractReleaseNotes(
+                config.releaseNoteRegex,
+                GitUtils.fetchCommitMsgs(prevDistPointHash) )
+
+        Utils.writeReleaseNotes(buildNotes, config.releaseNotesFile())
+
+        if (Utils.fabricAvailable(project)) {
+            project.ext.betaDistributionReleaseNotes = buildNotes
+            Log.info("published release notes for use by fabric")
+        }
+
+        config.persistVersion()
+
+        def commitMsg = "$newTagName\n\n${buildNotes.join('\n')}"
+        Log.info("committing distribution version changes");
+        GitUtils.gitCommitAll(commitMsg)
+        Log.info("tagging build commit");
+        GitUtils.makeGitTag(newTagName, newTagName)
+    }
+}
+
+class TagReleasePointTask extends DefaultTask {
+
+    public TagReleasePointTask() {
+        group = C.GROUP_DISTRIBUTION_UTILITY
+    }
+
+    @TaskAction
+    void tagReleasePoint() {
+        if (project.hasProperty("tag")) {
+            def tag = project.property("tag")
+            def commit = GitUtils.fetchTagCommit(project.property("tag")) as String
+            if (commit != null && !commit.empty) {
+                GitUtils.tagCommit("release-$tag", commit, "build $tag released")
+            } else {
+                Log.info("Tag \"$tag\" not found. Can't tag release point.")
+            }
+        } else {
+            if (GitUtils.isHEADBuildExportPoint()) {
+                def tag = GitUtils.fetchHeadBuildTagName()
+                GitUtils.makeGitTag("release-$tag", "build $tag released")
+            } else {
+                Log.abort("Export point missing. " +
+                        "Either HEAD must be a build export point to tag " +
+                        "a release or specify an export point tag via -Ptag=<tagName>")
+            }
+        }
+    }
+}
+
+class ExportReleaseNotes extends DefaultTask {
+
+    public ExportReleaseNotes() {
+        outputs.upToDateWhen{ false }
+        this.dependsOn(C.DIST_CONFIG_TASK)
+        group = C.GROUP_DISTRIBUTION_UTILITY
+    }
+
+    @TaskAction
+    public void exportReleaseNotes() {
+        DistConfig config = project.ext.distConfig
+        def releasedVersion = ""
+        List<String> tags = GitUtils.fetchTagsByDate()
+        List<String> buildTagsSinceRelease = new ArrayList<String>()
+        boolean currentReleaseTag = true
+        for (int i = tags.size()-1; i >= 0; i--) {
+            if (tags.get(i).startsWith("release-")) {
+                if (currentReleaseTag) {
+                    currentReleaseTag = false
+                    releasedVersion = tags.get(i).substring("release-".length())
+                } else {
+                    break;
+                }
+            }
+            if (tags.get(i).startsWith("v")) {
+                buildTagsSinceRelease.add(tags.get(i))
+            }
+        }
+
+        List<String> outputText = new ArrayList<String>(1024)
+
+        buildTagsSinceRelease.each { tagName ->
+            List<String> msg = GitUtils.fetchCommitMessage(GitUtils.fetchTagCommit(tagName))
+            if (!outputText.isEmpty()) {
+                outputText.addAll(Arrays.asList("", "", ""))
+            }
+            outputText.addAll(msg)
+        }
+        File output = new File(config.dir, "Release-Notes-${releasedVersion}.txt");
+        output.withPrintWriter { wr ->
+            outputText.each { line -> wr.println(line) }
+        }
+        Log.info("Release notes written to: ${output.absolutePath}")
+    }
+}
+
+/**
+ * Sends the prepared distribution files(apks).
+ */
+class EmailDistTask extends DefaultTask {
+
+    public EmailDistTask() {
+        dependsOn(C.DIST_CONFIG_TASK)
+//        dependsOn("validateSendBuild")
+        dependsOn("fetchBuildNotes")
+
+        group = C.GROUP_DIST_SEND
+    }
+
+    @TaskAction
+    public send() {
+
+        DistConfig cfg = project.ext.distConfig
+        Distribution distribution = project.ext.distribution
+
+        List<File> apks = distribution.apks().findAll { f -> return f.exists()}
+        List<EmailAttachment> emailAttachments = apks.collect { file ->
+            EmailAttachment a = new EmailAttachment()
+            a.setPath(file.absolutePath)
+            a.setDisposition(EmailAttachment.ATTACHMENT)
+            a.setDescription(file.name)
+            a.setName(file.name)
+            a
+        }
+
+        MultiPartEmail mpe = new MultiPartEmail()
+        mpe.setHostName(cfg.smtpServer())
+        mpe.setFrom(cfg.mailFrom())
+        cfg.mailTo().split(",").each { mpe.addTo(it.trim()) }
+        mpe.setSubject("${cfg.mailSubjectPrefix(project.name)} builds. Version ${cfg.current.versionString()}")
+        mpe.setMsg(project.ext.betaDistributionReleaseNotes)
+        emailAttachments.each { mpe.attach(it) }
+
+
+        Session s = createSmtpSession(cfg)
+        javax.mail.Transport transport = s.getTransport("smtps");
+        transport.connect(cfg.smtpServer(), cfg.smtpServerPort(), cfg.mailFrom(), cfg.mailFromPassword())
+
+        mpe.buildMimeMessage()
+        def msg = mpe.getMimeMessage()
+        transport.sendMessage(msg, msg.getRecipients(javax.mail.Message.RecipientType.TO))
+        try {
+            transport.close()
+        } catch (Exception ex) {
+            System.err.println("error closing transport")
+            ex.printStackTrace()
+        }
+    }
+
+    private static Session createSmtpSession(DistConfig cfg) {
+        // NOTE: this may be externalized to the config files
+        final Properties props = new Properties();
+        props.setProperty("mail.host", cfg.smtpServer());
+        props.setProperty("mail.smtp.auth", "true");
+        props.setProperty("mail.smtp.starttls.enable", "true");
+        props.setProperty("mail.transport.protocol", "smtp");
+
+        def auth = new javax.mail.Authenticator() {
+//            @Override
+//            public PasswordAuthentication getPasswordAuthentication() {
+//                return new PasswordAuthentication(cfg.mailFrom(), cfg.mailFromPassword());
+//            }
+
+            @Override public javax.mail.PasswordAuthentication getPasswordAuthentication() {
+                return new javax.mail.PasswordAuthentication(cfg.mailFrom(), cfg.mailFromPassword());
+            }
+
+        }
+        return Session.getInstance(props, auth);
+    }
+}
+
+// ====================================
+// Script tasks definition
+// ====================================
+
+task distConfigTask {
+    project.ext.distConfig = new DistConfig(project, project.getProjectDir());
+    doLast {
+            boolean sendingDistribution = false;
+            for (String name : project.getGradle().startParameter.taskNames) {
+                Task t = project.tasks.findByName(name)
+                if ((t != null && C.GROUP_DIST_SEND.equalsIgnoreCase(t.group)) ||
+                    name.startsWith(C.CRASHLYTICS_UPLOAD_BASE_NAME)) {
+                    sendingDistribution = true
+                    break;
+                }
+            }
+            if (!sendingDistribution) {
+                project.ext.distConfig.adjustVersion()
+            } else {
+                Log.info("Version not adjusted. Sending distribution.")
+            }
+
+
+            if (project.ext.distConfig.versionChanged())
+                info("Version changed from ${project.ext.distConfig.previous.versionString(false)} " +
+                                    "to ${project.ext.distConfig.current.versionString(false)}")
+
+    }
+}
+
+task validateSendBuild {
+    dependsOn { "checkWorkingDir" }
+    doLast {
+        if (!GitUtils.isHEADBuildExportPoint()) {
+            abort("HEAD is not a distribution point. Can not send build.")
+        }
+    }
+}
+task fetchBuildNotes {
+    def commit = GitUtils.fetchTagCommit(GitUtils.fetchTag("v*"))
+    def notes = GitUtils.fetchCommitMessage(commit).join('\n')
+
+    project.ext.betaDistributionReleaseNotes = notes
+
+    android.buildTypes.each { bt ->
+        bt.ext.betaDistributionReleaseNotes = notes
+        bt.ext.betaDistributionEmails = project.ext.distConfig.mailTo()
+    }
+
+}
+
+task checkWorkingDir {
+    dependsOn { C.DIST_CONFIG_TASK }
+    doLast {
+        if (!isWorkingDirClean()) {
+            abort("Working directory not clean")
+        }
+        info("DistConfig finished. Working directory clean. Version is ${project.ext.distConfig.current.versionString()}. ")
+    }
+}
+
+task dist(name: "dist", type: Dist)
+
+task tagRelease(name: "tagRelease", type: TagReleasePointTask)
+
+task exportReleaseNotes(name: "exportReleaseNotes", type: ExportReleaseNotes)
+
+task emailDist(name: "emailDist", type: EmailDistTask)
+
+// ====================================
+// script wire-up and actual project task definitions
+// ====================================
+
+def createAccumulatorTask(String targetName, String targetGroup, String nameRegex, boolean removeIfNoDependencies = true) {
+    Task target = project.tasks.findByName(targetName)
+    if (target != null) {
+        Log.info("Can't create accumulator task. Task with the name ${targetName} already exists.")
+        return target
+    }
+    target = project.tasks.create(targetName)
+    target.group = targetGroup
+
+    boolean dependenciesAdded = false
+    project.tasks.each { t ->
+        if (t.name.matches(nameRegex)) {
+            target.dependsOn(t.name)
+            dependenciesAdded = true
+        }
+    }
+    if (dependenciesAdded) {
+        return target
+    } else {
+        Log.info("no dependencies were found for $targetName filtering by $nameRegex. Removing task.")
+        project.tasks.remove(target)
+        return null
+    }
+}
+
+afterEvaluate {
+    DistConfig config = project.ext.distConfig
+
+    project.ext.distribution = new Distribution()
+
+    android.applicationVariants.all { variant ->
+
+        // hook up distribution config and update the flavor version properties.
+        variant.preBuild.dependsOn C.DIST_CONFIG_TASK
+        variant.preBuild.doLast {
+            variant.mergedFlavor.versionName = project.ext.distConfig.current.apkVersionString()
+            variant.mergedFlavor.versionCode = project.ext.distConfig.current.androidVersionCode
+        }
+
+        // rename the output APKs
+        variant.outputs.each { output ->
+            File f = (output.zipAlign) ? output.outputFile : output.packageApplication.outputFile
+            def basename = config.baseApkName()
+            if (basename == null) {
+                basename = "";
+            }
+            basename = basename + f.name.substring(0, f.name.lastIndexOf(".apk"))
+
+            def newName = "${basename}-${config.current.versionString()}.apk"
+            if (output.zipAlign) {
+                output.outputFile = new File(f.parent, newName)
+                project.ext.distribution.addAPK(output.outputFile)
+            } else {
+                output.packageApplication.outputFile = new File(f.parent, newName)
+                project.ext.distribution.addAPK(output.packageApplication.outputFile)
+            }
+        }
+    }
+
+    /* Fiddle with crashlytics.
+     * Create accumulative tasks for uploading all/debug/release builds
+     */
+    if (project.plugins.hasPlugin("io.fabric")) {
+        info("fabric plugin found. Creating crashlyticsUpload accumulator tasks")
+
+        // hook up our dependencies
+        project.tasks.each { t ->
+            if (t.name.startsWith(C.CRASHLYTICS_UPLOAD_BASE_NAME)) {
+                t.dependsOn("validateSendBuild")
+                t.dependsOn("fetchBuildNotes")
+            }
+        }
+
+        createAccumulatorTask("crashlyticsUploadAll",
+                C.GROUP_DIST_SEND, "${C.CRASHLYTICS_UPLOAD_BASE_NAME}.*")
+
+        createAccumulatorTask("crashlyticsUploadAllDebug",
+                C.GROUP_DIST_SEND, "${C.CRASHLYTICS_UPLOAD_BASE_NAME}.*Debug")
+
+        createAccumulatorTask("crashlyticsUploadAllRelease",
+                C.GROUP_DIST_SEND, "${C.CRASHLYTICS_UPLOAD_BASE_NAME}.*Release")
+    }
+}
+
+if (project.plugins.hasPlugin("io.fabric")) {
+    project.tasks.whenTaskAdded { t ->
+        if (t.name.startsWith(C.CRASHLYTICS_UPLOAD_BASE_NAME)) {
+            // bug fix: crashlytics doesn't seem to assign its tasks to a group
+            // so the do not show with the 'gradle tasks' command.
+            // If this is still the case put them under "Distribution Send" tasks group
+            if (t.group == null || t.group.empty) {
+                t.group = C.GROUP_DIST_SEND
+            }
+        }
+
+    }
+}
