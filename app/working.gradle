@@ -1,0 +1,81 @@
+task automate << {
+    Properties props = new Properties()
+    File versionFile = new File(project.getProjectDir(), "version.properties")
+    versionFile.withInputStream {
+        props.load(it)
+    }
+
+    Version version = Version.read(props)
+
+    version.bumpMinor()
+
+    println version.original().asString()
+    println version.asString()
+
+    version.asProperties().store(new FileOutputStream(versionFile), "Storing")
+
+}
+
+final class Version {
+    int major, minor, patch
+    Version original
+
+    public Version() {}
+
+    public Version(int major, int minor, int patch) {
+        this.major = major
+        this.minor = minor
+        this.patch = patch
+        this.original = new Version()
+        this.original.major = major
+        this.original.minor = minor
+        this.original.patch = patch
+    }
+
+    Properties asProperties() {
+        def properties = new Properties()
+        properties["major"] = major as String
+        properties["minor"] = minor as String
+        properties["patch"] = patch as String
+
+        properties
+    }
+
+    def asString() {
+        "$major.$minor.$patch"
+    }
+
+    def bumpPatch() {
+        copyProperties(this, original)
+        ++patch
+        this
+    }
+
+    def bumpMinor() {
+        copyProperties(this, original)
+        ++minor;
+        patch = 0
+        this
+    }
+
+    def bumpMajor() {
+        copyProperties(this, original)
+        ++major;
+        minor = 0
+        patch = 0
+        this
+    }
+
+    def original() { original?: this}
+
+    public static Version read(Properties props) {
+        new Version(props["major"] as Integer, props["minor"] as Integer, props["patch"] as Integer)
+    }
+
+    private def copyProperties(source, target) {
+        source.properties.each { key, value ->
+            if (target.hasProperty(key) && !(key in ['class', 'metaClass']))
+                target[key] = value
+        }
+    }
+}

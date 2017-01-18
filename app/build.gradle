@@ -1,5 +1,5 @@
 apply plugin: 'com.android.application'
-apply from: 'version.gradle'
+apply from: 'working.gradle'
 
 android {
     compileSdkVersion 25
@@ -9,7 +9,7 @@ android {
         minSdkVersion 21
         targetSdkVersion 25
         versionCode 1
-        versionName "${project.appversion.major}.${project.appversion.minor}.${project.appversion.patch}"
+        versionName "1.0"
         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
